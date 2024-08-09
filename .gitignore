@@ -1,0 +1,7 @@
+node_modules
+sessions
+modelo_dias.json
+modelo_meses.json
+modelo_semanas.json
+package-lock.json
+package.json
