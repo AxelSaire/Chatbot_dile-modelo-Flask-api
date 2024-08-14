@@ -4,22 +4,57 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Carga tus modelos de riesgo de crédito
-modelos = {
-    'DIARIA': xgb.Booster(),
-    'MENSUAL': xgb.Booster(),
-    'SEMANAL': xgb.Booster()
-}
-
-modelos['DIARIA'].load_model('modelo_dias.json')
-modelos['MENSUAL'].load_model('modelo_meses.json')
-modelos['SEMANAL'].load_model('modelo_semanas.json')
+# Carga el modelo general
+modelo = xgb.Booster()
+modelo.load_model('modelo_general.json')
 
 def prepare_input_data(data):
-    # Lista de todas las características que el modelo espera
+    # Mapeos para convertir números a texto
+    frecuencia_map = {'1': 'MESES', '2': 'SEMANAS'}
+    sexo_map = {'1': 'F', '2': 'M'}
+    estado_civil_map = {
+        '1': 'Casado (a)',
+        '2': 'Conviviente',
+        '3': 'Divorciado (a)',
+        '4': 'Separado (a)',
+        '5': 'Soltero (a)',
+        '6': 'Viudo (a)'
+    }
+    giro_map = {
+        '1': 'ABARROTES',
+        '2': 'AUTOMOTRIZ',
+        '3': 'BOTICA',
+        '4': 'CARPINTERIA',
+        '5': 'COMERCIANTE',
+        '6': 'COMERCIO DE ALIMENTOS',
+        '7': 'COMERCIO DE ANIMALES',
+        '8': 'COMERCIO DE ARTESANIA',
+        '9': 'COMERCIO DE BEBIDAS',
+        '10': 'COMERCIO DE CELULARES',
+        '11': 'COMERCIO DE PROD NO ALIMENTICIOS',
+        '12': 'COMERCIO DE ROPA',
+        '13': 'COMERCIO FERRETERO',
+        '14': 'COMERCIO MINORISTA',
+        '15': 'OFICIO',
+        '16': 'OFICIO CONSTRUCCION',
+        '17': 'OTROS',
+        '18': 'PRESTADOR DE SERVICIOS',
+        '19': 'PROFESIONAL',
+        '20': 'RESTAURANTE'
+    }
+
+    # Convertir los datos de entrada numéricos a su representación de texto
+    text_data = {
+        'EDAD': data.get('EDAD', 0),
+        'NOM_FRECUENCIA': frecuencia_map.get(str(data.get('NOM_FRECUENCIA', '')), ''),
+        'SEXO': sexo_map.get(str(data.get('SEXO', '')), ''),
+        'ESTADO_CIVIL': estado_civil_map.get(str(data.get('ESTADO_CIVIL', '')), ''),
+        'GIROS': giro_map.get(str(data.get('GIRO', '')), '')
+    }
+
+    # Lista de todas las características que el modelo espera, en el orden correcto
     expected_features = [
-        "CUOTA_FIJA", "TEA_INTERES", "EDAD", 
-        "TIPO_VIVIENDA_ALQUILADA", "TIPO_VIVIENDA_FAMILIAR", "TIPO_VIVIENDA_PROPIA",
+        "EDAD", "NOM_FRECUENCIA_MESES", "NOM_FRECUENCIA_SEMANAS", "SEXO_F", "SEXO_M",
         "ESTADO_CIVIL_Casado (a)", "ESTADO_CIVIL_Conviviente", "ESTADO_CIVIL_Divorciado (a)",
         "ESTADO_CIVIL_Separado (a)", "ESTADO_CIVIL_Soltero (a)", "ESTADO_CIVIL_Viudo (a)",
         "GIROS_ABARROTES", "GIROS_AUTOMOTRIZ", "GIROS_BOTICA", "GIROS_CARPINTERIA",
@@ -34,24 +69,27 @@ def prepare_input_data(data):
     prepared_data = {feature: 0 for feature in expected_features}
     
     # Actualizar con los valores proporcionados
-    prepared_data['EDAD'] = data.get('EDAD', 0)
-    prepared_data['CUOTA_FIJA'] = data.get('CUOTA_FIJA', 0)  # asume un valor por defecto si no se proporciona
-    prepared_data['TEA_INTERES'] = data.get('TEA_INTERES', 0)  # asume un valor por defecto si no se proporciona
+    prepared_data['EDAD'] = text_data['EDAD']
     
-    # Crear variables dummy para TIPO_VIVIENDA
-    tipo_vivienda = data.get('TIPO_VIVIENDA', '').upper()
-    if tipo_vivienda in ['ALQUILADA', 'FAMILIAR', 'PROPIA']:
-        prepared_data[f'TIPO_VIVIENDA_{tipo_vivienda}'] = 1
+    # Crear variables dummy para NOM_FRECUENCIA
+    if text_data['NOM_FRECUENCIA'] == 'MESES':
+        prepared_data['NOM_FRECUENCIA_MESES'] = 1
+    elif text_data['NOM_FRECUENCIA'] == 'SEMANAS':
+        prepared_data['NOM_FRECUENCIA_SEMANAS'] = 1
+    
+    # Crear variables dummy para SEXO
+    if text_data['SEXO'] == 'F':
+        prepared_data['SEXO_F'] = 1
+    elif text_data['SEXO'] == 'M':
+        prepared_data['SEXO_M'] = 1
     
     # Crear variables dummy para ESTADO_CIVIL
-    estado_civil = data.get('ESTADO_CIVIL', '')
-    if estado_civil in ['Casado (a)', 'Conviviente', 'Divorciado (a)', 'Separado (a)', 'Soltero (a)', 'Viudo (a)']:
-        prepared_data[f'ESTADO_CIVIL_{estado_civil}'] = 1
+    if text_data['ESTADO_CIVIL']:
+        prepared_data[f'ESTADO_CIVIL_{text_data["ESTADO_CIVIL"]}'] = 1
     
     # Crear variables dummy para GIRO
-    giro = data.get('GIRO', '').upper().replace(' ', '_')
-    if f'GIROS_{giro}' in expected_features:
-        prepared_data[f'GIROS_{giro}'] = 1
+    if text_data['GIROS']:
+        prepared_data[f'GIROS_{text_data["GIROS"]}'] = 1
     
     # Convertir a DataFrame
     df = pd.DataFrame([prepared_data])
@@ -61,58 +99,30 @@ def prepare_input_data(data):
     
     return df
 
-def categorize_score(puntaje, frecuencia):
-    if frecuencia == 'MENSUAL':
-        if 0 <= puntaje <= 0.25:
-            return 'Muy Bueno'
-        elif 0.25 < puntaje <= 0.35:
-            return 'Bueno'
-        elif 0.35 < puntaje <= 0.5:
-            return 'Regular'
-        else:
-            return 'Malo'
-    elif frecuencia == 'SEMANAL':
-        if 0 <= puntaje <= 0.35:
-            return 'Bueno'
-        elif 0.35 < puntaje <= 0.5:
-            return 'Regular'
-        else:
-            return 'Malo'
-    elif frecuencia == 'DIARIA':
-        if 0 <= puntaje <= 0.2:
-            return 'Muy Bueno'
-        elif 0.2 < puntaje <= 0.35:
-            return 'Bueno'
-        elif 0.35 < puntaje <= 0.5:
-            return 'Regular'
-        else:
-            return 'Malo'
+def categorize_score(puntaje):
+    if 0 <= puntaje < 505:
+        return 'Malo'
+    elif 505<= puntaje < 662.6:
+        return 'Regular'
     else:
-        return 'Desconocido'
+        return 'Bueno'
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
     if request.is_json:
         data = request.get_json()
         
-        frecuencia = data.pop('NOM_FRECUENCIA', 'MENSUAL').upper()
-        if frecuencia not in modelos:
-            return jsonify({"error": "Frecuencia no válida"}), 400
-        
         df_usuario = prepare_input_data(data)
-        
-        modelo = modelos[frecuencia]
         
         dmatrix_usuario = xgb.DMatrix(df_usuario)
         prediccion = modelo.predict(dmatrix_usuario)
         
         puntaje = float(prediccion[0])
-        puntaje_complemento = (1000 - puntaje*1000)  # Calculamos el complemento
-        categoria = categorize_score(puntaje, frecuencia)
+        puntaje_escalado = 1000 - puntaje * 1000  # Escalamos el puntaje a un rango de 0 a 1000
+        categoria = categorize_score(puntaje_escalado)
         
         resultado = {
-            'puntaje': puntaje, #puntaje,
-            'puntaje_complemento': puntaje_complemento,  
+            'puntaje': puntaje_escalado,
             'score': categoria
         }
         
@@ -121,4 +131,4 @@ def predict():
         return jsonify({"error": "El tipo de contenido debe ser application/json"}), 415
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5002, debug=True)
