@@ -1,6 +1,7 @@
 import pandas as pd
 import xgboost as xgb
 from flask import Flask, request, jsonify
+from pymongo import MongoClient
 
 app = Flask(__name__)
 
@@ -129,6 +130,45 @@ def predict():
         return jsonify(resultado)
     else:
         return jsonify({"error": "El tipo de contenido debe ser application/json"}), 415
+#----------------------------------------------------------------------
+client = MongoClient('mongodb://localhost:27017/')
+db = client['usuarios']  # Access the 'usuarios' database
+collection = db['usuarios']  # Access the 'usuarios' collection
 
+@app.route('/api/consultar', methods=['POST'])
+def consultar_numero():
+    data = request.get_json()  # Get the JSON data sent in the request
+    dni = data.get('dni')  # Extract the 'telefono' field
+
+    # Query the database to find the user with the provided phone number
+    user = collection.find_one({"dni": dni})
+
+    if user:
+        response = {
+            "success": True,
+            "message": "Número encontrado",
+            "data": {
+                "telefono": user.get("telefono"),
+                "dni": user.get("dni"),
+                "edad": user.get("edad"),
+                "sexo": user.get("sexo"),
+                "estado_civil": user.get("estado_civil"),
+                "giro": user.get("giro"),
+                "frecuencia": user.get("frecuencia"),
+                "puntaje": user.get("puntaje"),
+                "score": user.get("score"),
+                "fechaConsulta": user.get("fechaConsulta"),
+                "horaConsulta": user.get("horaConsulta"),
+                "datos": user.get("datos")
+            }
+        }
+    else:
+        response = {
+            "success": False,
+            "message": "Número no encontrado",
+            "data": {}
+        }
+
+    return jsonify(response)
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5002, debug=True)

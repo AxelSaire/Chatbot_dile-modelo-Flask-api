@@ -14,42 +14,6 @@ mongoose.connect('mongodb://127.0.0.1:27017/usuarios', {
 });
 
 
-// async function consultarDNI(dni) {
-//   const url = `https://api.wfacxs.com/consultas/dni/${dni}`;
-  
-//   async function intentarConsulta() {
-//     try {
-//       const response = await axios.get(url);
-//       if (response.data.success) {
-//         return response.data.data;
-//       } else {
-//         throw new Error(response.data.message || 'No se pudo obtener la información');
-//       }
-//     } catch (error) {
-//       console.error('Error en la consulta:', error.message);
-//       throw error;
-//     }
-//   }
-
-
-//   try {
-//     // Primer intento
-//     return await intentarConsulta();
-//   } catch (error) {
-//     console.log('Primer intento fallido, realizando segundo intento...');
-    
-//     // Esperar un momento antes del segundo intento
-//     await new Promise(resolve => setTimeout(resolve, 2000)); // Espera 2 segundos
-
-//     try {
-//       // Segundo intento
-//       return await intentarConsulta();
-//     } catch (error) {
-//       console.error('Error en ambos intentos de consulta:', error.message);
-//       throw new Error('No se pudo obtener la información después de dos intentos');
-//     }
-//   }
-// }
 async function consultarLicencia(dni) {
   const url = `https://api.factiliza.com/pe/v1/licencia/info/${dni}`;
   try {
@@ -81,7 +45,23 @@ async function consultarLicencia(dni) {
     }
   }
 }
-  
+async function verificarNumeroDNI(numero){
+  try {
+    const response = await axios.post('http://127.0.0.1:5002/api/consultar', {
+        dni:numero
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    console.log('API Response:', response.data);
+    console.log('Prueba', response.data.data.puntaje);
+    return response.data;
+  } catch (error) {
+    console.error('Error al verificar el usuario', error.response ? error.response.data : error.message);
+    return false;
+  }
+}
 async function consultarDNI(dni) {
     const url = `https://api.factiliza.com/pe/v1/dni/info/${dni}`;
   
@@ -96,11 +76,6 @@ async function consultarDNI(dni) {
       console.log('Respuesta completa:', response.data); // Muestra la respuesta completa para ver el formato
       if (response.data.success) {
         const data = response.data.data;
-        console.log('Número de DNI:', data.numero);
-        console.log('Nombre Completo:', data.nombre_completo);
-        console.log('Nombres:', data.nombres);
-        console.log('Apellido Paterno:', data.apellido_paterno);
-        console.log('Apellido Materno:', data.apellido_materno);
         return data;
       } else {
         console.log('Error en la respuesta:', response.data.message || 'No se pudo obtener la información');
@@ -208,22 +183,75 @@ const handleUserInput = async (client, message, userState) => {
       break;
     case 'esperando_dni':
       const dni = message.body.trim();
-
+    
       if (!isNaN(dni) && dni.length === 8) {
-        try {
-          const datosReniec = await consultarDNI(dni);
+          const datosSocio = await verificarNumeroDNI(dni);
+          console.log(datosSocio);     
+        if (datosSocio.success) {
+          // DNI exists in local database
           userState.dni = dni;
-          userState.datosReniec = datosReniec;
-
-          await client.sendText(message.from, `Según nuestros registros, tu *apellido paterno* es: *${datosReniec.apellido_paterno}*.\n\nPor favor, confirma si es correcto respondiendo *Sí* o *No*.`);
-          userState.step = 'confirmar_apellido';
-        } catch (error) {
-          await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
+          userState.datosSocio = datosSocio;
+          await client.sendText(message.from, `Hemos encontrado un registro tuyo. Tu *apellido paterno* es: *${datosSocio.data.datos.apellido_paterno.trim()}*. \n\n¿Es correcto? Responde *Sí* o *No*.`);
+          userState.step = 'obtener_riesgo';
+        } else {
+          // DNI doesn't exist in local database, proceed to validate with Reniec
+          userState.dni = dni;
+          //message.body = '.';
+          try {  
+            const datosReniec = await consultarDNI(userState.dni);
+            userState.datosReniec = datosReniec;
+            await client.sendText(message.from, `Según nuestros registros, tu *apellido paterno* es: *${datosReniec.apellido_paterno}*.\n\nPor favor, confirma si es correcto respondiendo *Sí* o *No*.`);
+            userState.step = 'confirmar_apellido';
+          } catch (error) {
+            console.error('Error al consultar DNI en Reniec:', error);
+            await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
+            userState.step = 'esperando_dni';
+          }
         }
       } else {
         await client.sendText(message.from, 'Por favor, ingresa un *DNI* válido (8 dígitos).');
       }
       break;
+        // if (!isNaN(dni) && dni.length === 8) {
+        //   try {
+        //     const datosSocio = await verificarNumeroDNI(dni);
+        //     console.log(datosSocio);
+            
+        //     if (datosSocio.success) {
+        //       // DNI exists in local database
+        //       userState.dni = dni;
+        //       userState.datosSocio = datosSocio;
+        //       await client.sendText(message.from, `Hemos encontrado tu registro. Tu nombre completo es: ${datosSocio.data.datos.nombres}. ¿Es correcto? Responde *Sí* o *No*.`);
+        //       userState.step = 'obtener_riesgo';
+        //     } else {
+        //       // DNI doesn't exist in local database, proceed to validate with Reniec
+        //       userState.dni = dni;
+        //       userState.step = 'validar_dni';
+        //       // Fall through to the next case without breaking
+        //     }
+        //   } catch (error) {
+        //     console.error('Error al verificar DNI en base local:', error);
+        //     await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
+        //     break;
+        //   }
+        // } else {
+        //   await client.sendText(message.from, 'Por favor, ingresa un *DNI* válido (8 dígitos).');
+        //   break;
+        // }
+    /*
+    case 'validar_dni':
+      try {  
+        const datosReniec = await consultarDNI(userState.dni);
+        userState.datosReniec = datosReniec;
+        await client.sendText(message.from, `Según nuestros registros, tu *apellido paterno* es: *${datosReniec.apellido_paterno}*.\n\nPor favor, confirma si es correcto respondiendo *Sí* o *No*.`);
+        userState.step = 'confirmar_apellido';
+      } catch (error) {
+        console.error('Error al consultar DNI en Reniec:', error);
+        await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
+        userState.step = 'esperando_dni';
+      }
+      break;
+      */
     case 'confirmar_apellido':
       const confirmacion = message.body.trim().toLowerCase();
 
@@ -372,6 +400,13 @@ const handleUserInput = async (client, message, userState) => {
         await client.sendText(message.from, 'Por favor, selecciona una opción válida:\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
       }
       break;
+    case 'obtener_riesgo':
+      console.log('Entrando al caso final');
+      // console.log(userState.datosSocio)
+      await client.sendText(message.from, `Hola *${userState.datosSocio.data.datos.nombre_completo.trim()}*\n\n Gracias por confiar en nosotros🫡`);
+      await client.sendText(message.from, `Tu *score crediticio* es: *${userState.datosSocio.data.puntaje}* 📊\n\n y tu *Calificación* es: *${userState.datosSocio.data.score}* `);
+      userState.processoCompletado = true;
+      break;
     default:
       reiniciarEstadoUsuario(userState);
       await client.sendText(message.from, 'Bienvenido. Vamos a calcular tu perfil de riesgo.');
@@ -430,7 +465,7 @@ function start(client) {
     let userState = userStates[message.from] || { step: 'bienvenida', lastActivity: Date.now(), warningShown: false, expirationShown: false, processoCompletado: false };
 
     // Si el proceso está completado o es un nuevo mensaje, reinicia el estado
-    if (userState.processoCompletado || ['hola', 'hello', 'hi', 'hey', 'inicio', 'empezar'].includes(message.body.toLowerCase().trim())) {
+    if (userState.processoCompletado || ['hola', 'hello', 'volver', 'salir', 'inicio', 'empezar'].includes(message.body.toLowerCase().trim())) {
       reiniciarEstadoUsuario(userState);
     }
     userStates[message.from] = userState;
