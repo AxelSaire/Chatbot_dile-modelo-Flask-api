@@ -135,6 +135,38 @@ client = MongoClient('mongodb://localhost:27017/')
 db = client['usuarios']  # Access the 'usuarios' database
 collection = db['usuarios']  # Access the 'usuarios' collection
 
+@app.route('/api/actualizar', methods=['POST'])
+def actualizar_usuario():
+    data = request.get_json()  # Obtiene los datos JSON enviados en la solicitud
+    dni = data.get('dni')  # Extrae el campo 'dni'
+    
+    # Verifica si el DNI fue proporcionado
+    if not dni:
+        return jsonify({"success": False, "message": "DNI no proporcionado"}), 400
+    
+    # Buscar el usuario en la colección basado en el DNI
+    user = collection.find_one({"dni": dni})
+    
+    if user:
+        # Actualizar la información del usuario. Por ejemplo, actualizar el nombre y la edad:
+        updated_data = {
+            #"edad": data.get("edad", user["edad"]),
+            #"sexo": data.get("sexo", user["sexo"]),
+            "estado_civil" : data.get("estado_civil", user["estado_civil"]),
+            "giro" : data.get("giro", user["giro"]),
+            "frecuencia" : data.get("frecuencia", user["frecuencia"]),
+            "puntaje" : data.get("puntaje", user["puntaje"]),
+            "score": data.get("score", user["score"])
+        }
+        
+        result = collection.update_one({"dni": dni}, {"$set": updated_data})
+        
+        if result.modified_count > 0:
+            return jsonify({"success": True, "message": "Usuario actualizado correctamente"})
+        else:
+            return jsonify({"success": False, "message": "No se realizó ninguna actualización"}), 304
+    else:
+        return jsonify({"success": False, "message": "Usuario no encontrado"}), 404
 @app.route('/api/consultar', methods=['POST'])
 def consultar_numero():
     data = request.get_json()  # Get the JSON data sent in the request

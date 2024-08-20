@@ -2,6 +2,7 @@ const axios = require('axios');
 const venom = require('venom-bot');
 const mongoose = require('mongoose');
 const { API_TOKEN, API_URL } = require('./config');
+const dicc = require('./dict.js');
 
 // Conectar a MongoDB
 mongoose.connect('mongodb://127.0.0.1:27017/usuarios', {
@@ -111,7 +112,28 @@ const GetPerfilRiesgoSocio = async (EDAD, ESTADO_CIVIL, GIRO, NOM_FRECUENCIA, SE
     return false;
   }
 };
-
+function actualizarDatos(dni, estado_civil, giro,frecuencia, puntaje, score) {
+  axios.post('http://127.0.0.1:5002/api/actualizar', {
+      dni: dni,
+      estado_civil: estado_civil,
+      giro: giro,
+      frecuencia: frecuencia, 
+      puntaje: puntaje,
+      score: score
+  })
+  .then(function (response) {
+      // Manejar la respuesta exitosa
+      if (response.data.success) {
+          console.log("Usuario actualizado:", response.data.message);
+      } else {
+          console.warn("No se pudo actualizar el usuario:", response.data.message);
+      }
+  })
+  .catch(function (error) {
+      // Manejar errores
+      console.error("Error en la actualización:", error.response ? error.response.data : error.message);
+  });
+}
 // Definir el esquema y el modelo
 const usuarioSchema = new mongoose.Schema({
   telefono: String,
@@ -191,8 +213,8 @@ const handleUserInput = async (client, message, userState) => {
           // DNI exists in local database
           userState.dni = dni;
           userState.datosSocio = datosSocio;
-          await client.sendText(message.from, `Hemos encontrado un registro tuyo. Tu *apellido paterno* es: *${datosSocio.data.datos.apellido_paterno.trim()}*. \n\n¿Es correcto? Responde *Sí* o *No*.`);
-          userState.step = 'obtener_riesgo';
+          await client.sendText(message.from, `Hola Sr(a) *${datosSocio.data.datos.nombres.trim()}* hemos encontrado un registro suyo.\n\nPor favor, confirma si es correcto respondiendo *Correcto* o *Act* para actualizar tus datos.`);
+          userState.step = 'actualizar';
         } else {
           // DNI doesn't exist in local database, proceed to validate with Reniec
           userState.dni = dni;
@@ -212,6 +234,54 @@ const handleUserInput = async (client, message, userState) => {
         await client.sendText(message.from, 'Por favor, ingresa un *DNI* válido (8 dígitos).');
       }
       break;
+    case 'actualizar':
+      //await client.sendText(message.from, 'Seleccionaste la ') 
+      rpta = message.body.trim().toLowerCase() 
+      if (rpta === 'actualizar'|| rpta === 'act') {
+          await client.sendText(message.from,'MENU *estado civil*: 1️⃣ *Casado(a)* 💍\n2️⃣ *Conviviente* 🤝\n3️⃣ *Divorciado(a)* 🔄\n4️⃣ *Separado(a)* ↔️\n5️⃣ *Soltero(a)*\n6️⃣ *Viudo(a)*');
+          userState.step='actualizar_Estado_Civil';
+        }
+      else if(rpta ==='correcto'|| rpta ==='ok' || rpta ==='si' || rpta==='sí'||rpta ==='correct'){
+        datosGuardados=userState.datosSocio.data
+        await client.sendText(message.from, `Estos son tus datos\n\n *Edad*: ${datosGuardados.edad}🕯️\n *Estado_Civil*: ${dicc.estado_civil[datosGuardados.estado_civil]}\n *Giro*: ${dicc.ocupacion[datosGuardados.giro]} \n *Frecuencia*: ${dicc.frecuencia[datosGuardados.frecuencia]}, \n¿Es correcto? `);
+        userState.step='obtener_riesgo';
+      }
+      else{
+        await client.sendText(message.from, 'Ingrese una opción válida, *ok* para confirmar *act* para actualizar')
+      }
+        break;
+      case 'actualizar_Estado_Civil':
+        if (['1', '2', '3', '4', '5', '6'].includes(message.body.trim())) {
+          userState.estado_civil = message.body.trim();
+          await client.sendText(message.from, 'Selecciona tu *ocupación*:\n1️⃣ ABARROTES 🛒\n2️⃣ AUTOMOTRIZ 🚗\n3️⃣ BOTICA 💊\n4️⃣ CARPINTERÍA 🪚\n5️⃣ COMERCIANTE 🏪\n6️⃣ COMERCIO DE ALIMENTOS 🥗\n7️⃣ COMERCIO DE ANIMALES 🐾\n8️⃣ COMERCIO DE ARTESANÍA 🎨\n9️⃣ COMERCIO DE BEBIDAS 🥤\n🔟 COMERCIO DE CELULARES 📱\n1️⃣1️⃣ COMERCIO DE PROD. NO ALIMENTICIOS 🛍️\n1️⃣2️⃣ COMERCIO DE ROPA 👕\n1️⃣3️⃣ COMERCIO FERRETERO 🧰\n1️⃣4️⃣ COMERCIO MINORista 🏬\n1️⃣5️⃣ OFICIO 🧑‍🔧\n1️⃣6️⃣ OFICIO CONSTRUCCIÓN 🏗️\n1️⃣7️⃣ OTROS 🌐\n1️⃣8️⃣ PRESTADOR DE SERVICIOS 📑\n1️⃣9️⃣ PROFESIONAL 👔\n2️⃣0️⃣ RESTAURANTE 🍽️');
+          userState.step = 'actualizar_giro';
+        } else {
+          await client.sendText(message.from, 'Por favor, selecciona una opción válida entre 1️⃣ y 6️⃣.');
+        }
+        break;
+      case 'actualizar_giro':
+        if (['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'].includes(message.body.trim())) {
+          userState.giro = message.body.trim();
+          await client.sendText(message.from, '¿Cómo prefieres pagar tus cuotas? 💰\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
+          userState.step = 'actualizar_frecuencia';
+        } else {
+          await client.sendText(message.from, 'Por favor, selecciona una opción válida entre 1️⃣ y 2️⃣0️⃣.');
+        }
+        break;
+      case 'actualizar_frecuencia':
+        if (['1', '2'].includes(message.body.trim())) {
+         userState.frecuencia = message.body.trim();
+ 
+         // Llamar a la API para obtener el perfil de riesgo
+         const perfilRiesgo = await GetPerfilRiesgoSocio(userState.datosSocio.data.edad, userState.estado_civil, userState.giro, userState.frecuencia, userState.datosSocio.data.sexo);
+         console.log(perfilRiesgo);
+         actualizarDatos(userState.dni, userState.estado_civil,userState.giro, userState.frecuencia, perfilRiesgo.puntaje, perfilRiesgo.score);
+         await client.sendText(message.from, 'Tus datos han sido actualizados, actualiza para obtener tu score crediticio');
+         userState.processoCompletado = true;
+        } else {
+        await client.sendText(message.from, 'Por favor, selecciona una opción válida:\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
+        }
+         break;
         // if (!isNaN(dni) && dni.length === 8) {
         //   try {
         //     const datosSocio = await verificarNumeroDNI(dni);
@@ -256,7 +326,7 @@ const handleUserInput = async (client, message, userState) => {
       const confirmacion = message.body.trim().toLowerCase();
 
       if (confirmacion === 'sí' || confirmacion === 'si') {
-        const { nombres, apellido_paterno, apellido_materno, nombre_completo, departamento, provincia, distrito, direccion, direccion_completa, ubigeo_reniec, ubigeo_sunat, ubigeo, fecha_nacimiento, estado_civil, foto, sexo } = userState.datosReniec;
+        const { nombres} = userState.datosReniec;//, apellido_paterno, apellido_materno, nombre_completo, departamento, provincia, distrito, direccion, direccion_completa, ubigeo_reniec, ubigeo_sunat, ubigeo, fecha_nacimiento, estado_civil, foto, sexo } = userState.datosReniec;
         await client.sendText(message.from, `Hola *${nombres.trim()}* Gracias por escribirnos\n\n Ahora, por favor dime tu *edad*: 🎂`);
         userState.step = 'esperando_edad';
       } else if (confirmacion === 'no') {
@@ -403,8 +473,8 @@ const handleUserInput = async (client, message, userState) => {
     case 'obtener_riesgo':
       console.log('Entrando al caso final');
       // console.log(userState.datosSocio)
-      await client.sendText(message.from, `Hola *${userState.datosSocio.data.datos.nombre_completo.trim()}*\n\n Gracias por confiar en nosotros🫡`);
-      await client.sendText(message.from, `Tu *score crediticio* es: *${userState.datosSocio.data.puntaje}* 📊\n\n y tu *Calificación* es: *${userState.datosSocio.data.score}* `);
+      await client.sendText(message.from, `Gracias por confiar en nosotros🫡`);
+      await client.sendText(message.from, `Su *score crediticio* es: *${userState.datosSocio.data.puntaje}* 📊\n\n y su *Calificación* es de: *${userState.datosSocio.data.score}* `);
       userState.processoCompletado = true;
       break;
     default:
@@ -502,6 +572,7 @@ function start(client) {
         } else if (inactiveTime > TIMEOUT && !state.expirationShown) {
           client.sendText(userId, "Tu sesión ha expirado por inactividad. Por favor, escribe 'hola' para comenzar de nuevo cuando estés listo.");
           reiniciarEstadoUsuario(state);
+          state.warningShown = true;
           state.expirationShown = true;
         }
       }
