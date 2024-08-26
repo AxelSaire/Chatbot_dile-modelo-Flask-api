@@ -1,8 +1,12 @@
 const axios = require('axios');
 const venom = require('venom-bot');
 const mongoose = require('mongoose');
-const { API_TOKEN, API_URL } = require('./config');
+const { API_TOKEN, API_URL, USUARIO_TOKEN } = require('./config');
 const dicc = require('./dict.js');
+const exclusionList = require('./exclusion_list.js');
+const fs = require('fs').promises;
+const XLSX = require("xlsx");
+const path = require("path");
 
 // Conectar a MongoDB
 mongoose.connect('mongodb://127.0.0.1:27017/usuarios', {
@@ -14,38 +18,164 @@ mongoose.connect('mongodb://127.0.0.1:27017/usuarios', {
   console.error('Error al conectar a MongoDB:', error);
 });
 
+/************************************* enviar reporte a  colaboradores autorizados */
+//Manejo del comando de reporte
+const handleReportCommand = async (client, message, reportState) => {
+  const sendMessage = async (text) => await client.sendText(message.from, text);
+  const getSafeMessageBody = () => (message?.body?.trim() ?? '');
 
-async function consultarLicencia(dni) {
-  const url = `https://api.factiliza.com/pe/v1/licencia/info/${dni}`;
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        Authorization: `Bearer ${API_TOKEN}`
+  const handleSteps = {
+    inicio_reporte: async () => {
+      await sendMessage("Has solicitado un reporte. Por favor, proporciona la siguiente información:");
+      await sendMessage("Ingresa tu número de usuario (8 dígitos):");
+      reportState.step = 'esperando_user';
+      reportState.lastActivity = Date.now();
+    },
+    esperando_user: async () => {
+      const user = getSafeMessageBody();
+      if (/^\d{8}$/.test(user)) {
+        reportState.user = user;
+        await sendMessage("Ingresa la fecha de inicio del reporte (formato YYYY-MM-DD):");
+        reportState.step = 'esperando_fecha_inicio';
+        reportState.lastActivity = Date.now();
+      } else {
+        await sendMessage("Por favor, ingresa un número de usuario válido de 8 dígitos.");
       }
+    },
+    esperando_fecha_inicio: async () => {
+      const fechaInicio = getSafeMessageBody();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fechaInicio)) {
+        reportState.fecha_inicio = fechaInicio;
+        await sendMessage("Ingresa la fecha de fin del reporte (formato YYYY-MM-DD, mayor a 2024-08-12):");
+        reportState.step = 'esperando_fecha_fin';
+        reportState.lastActivity = Date.now();
+      } else {
+        await sendMessage("Formato de fecha incorrecto. Por favor, usa el formato YYYY-MM-DD.");
+      }
+    },
+    esperando_fecha_fin: async () => {
+      const fechaFin = getSafeMessageBody();
+      const fechaLimite = new Date("2024-08-12");
+      const fechaFinDate = new Date(fechaFin);
 
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fechaFin)) {
+        if (fechaFinDate > fechaLimite) {
+          reportState.fecha_fin = fechaFin;
+          await generarYEnviarReporte(client, message.from, reportState);
+          await sendMessage("Reporte completado. Si necesitas algo más estoy aquí a la espera.");
+          reportState.processoCompletado = true;
+          reportState.step = 'bienvenida';
+          reportState.lastActivity = Date.now();
+        } else {
+          await sendMessage("La fecha de fin debe ser posterior al 12 de agosto de 2024.");
+        }
+      } else {
+        await sendMessage("Formato de fecha incorrecto. Por favor, usa el formato YYYY-MM-DD.");
+      }
+    }
+  };
+
+  if (handleSteps[reportState.step]) {
+    await handleSteps[reportState.step]();
+  } else {
+    // Reiniciar el estado y procesoCompletado al iniciar un nuevo proceso
+    reiniciarEstadoUsuario(reportState);
+    await sendMessage('Bienvenido.');
+    await handleSteps.inicio_reporte();
+  }
+};
+//--------------extraer data
+async function obtenerDatosDeAPI(reportState) {
+  try {
+    const response = await fetch('https://ram-special-evenly.ngrok-free.app/api-mongo/api/get_report_chatbotv1', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        user: reportState.user,
+        token: USUARIO_TOKEN,
+        fecha_inicio: reportState.fecha_inicio,
+        fecha_fin: reportState.fecha_fin
+      })
     });
-  
 
-    console.log('Respuesta completa:', response.data); // Muestra la respuesta completa para ver el formato
-    if (response.data.status == 200) { //response.data.success
-      const data = response.data.data;
-      console.log('Número de DNI:', response.data.data.numero_documento);
-      console.log('Nombres:', response.data.data.nombres);
-      console.log('Apellido Paterno:', response.data.data.apellido_paterno);
-      console.log('Apellido Materno:', response.data.data.apellido_materno);
-      console.log('licencia de conducir', response.data.data.licencia)
-      return data;
+    if (!response.ok) {
+      const rawResponse = await response.text();
+      console.error('Error en la API (raw response):', rawResponse);
+      throw new Error(`Error en la API: ${response.status} ${response.statusText}`);
+    }
+
+    const responseData = await response.json();
+    console.log('Respuesta de la API:', responseData);
+
+    // Verificar si la respuesta es un array
+    if (Array.isArray(responseData) && responseData.length > 0) {
+      const firstItem = responseData[0];
+
+      // Verificar si el primer elemento tiene la propiedad `data`
+      if (firstItem.data) {
+        return firstItem.data; // Retorna solo los registros de datos
+      } else {
+        throw new Error("La propiedad 'data' no se encuentra en la respuesta de la API");
+      }
     } else {
-      console.log('Error en la respuesta:', response.data.message || 'No se pudo obtener la información');
+      throw new Error("La respuesta de la API no es un array o está vacía");
     }
   } catch (error) {
-    if (error.response) {
-      console.error('Error HTTP:', error.response.status, error.response.data);
-    } else {
-      console.error('Error en la consulta:', error.message);
-    }
+    console.error('Error al obtener datos de la API:', error);
+    throw error;
   }
-}
+};
+
+
+async function generarYEnviarReporte(client, numero, reportState) {
+  try {
+    await client.sendText(numero, "Procesando tu solicitud de reporte...");
+
+    const responseData = await obtenerDatosDeAPI(reportState);
+
+    if (responseData.length === 0) {
+      await client.sendText(numero, "No se encontraron datos para el período especificado.");
+      return;
+    }
+
+    // Crear el libro de Excel
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(responseData);
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Reporte');
+
+    // Guardar el libro de Excel en un archivo temporal
+    const filePath = `${__dirname}/reporte_${reportState.fecha_inicio}_${reportState.fecha_fin}.xlsx`;
+    XLSX.writeFile(workbook, filePath);
+
+    // Enviar el archivo Excel
+    await client.sendFile(
+      numero,
+      filePath,
+      `Reporte_${reportState.fecha_inicio}_${reportState.fecha_fin}.xlsx`,
+      `Reporte del ${reportState.fecha_inicio} al ${reportState.fecha_fin}`
+    );
+
+    // Eliminar el archivo temporal
+    await eliminarArchivo(filePath);
+
+    await client.sendText(numero, "Reporte generado y enviado con éxito.");
+  } catch (error) {
+    console.error('Error al generar y enviar el reporte:', error);
+    await client.sendText(numero, "Hubo un error al generar el reporte. Por favor, contacta al administrador del sistema.");
+  }
+};
+// Función para eliminar archivo temporal
+async function eliminarArchivo(filePath) {
+  try {
+    await fs.unlink(filePath);
+    console.log('Archivo temporal eliminado:', filePath);
+  } catch (error) {
+    console.error('Error al eliminar el archivo temporal:', error);
+  }
+};
+//--------------
 async function verificarNumeroDNI(numero){
   try {
     const response = await axios.post('http://127.0.0.1:5002/api/consultar', {
@@ -67,28 +197,35 @@ async function consultarDNI(dni) {
     const url = `https://api.factiliza.com/pe/v1/dni/info/${dni}`;
   
     try {
-      const response = await axios.get(url, {
+      const {status, data} = await axios.get(url, {
         headers: {
           Authorization: `Bearer ${API_TOKEN}`
-        }
+        },
+        timeout: 10000
       });
     
-  
-      console.log('Respuesta completa:', response.data); // Muestra la respuesta completa para ver el formato
-      if (response.data.success) {
-        const data = response.data.data;
-        return data;
-      } else {
-        console.log('Error en la respuesta:', response.data.message || 'No se pudo obtener la información');
+      if (status === 200 && data?.data) {
+        console.log(data);
+        return data.data;
       }
-    } catch (error) {
-      if (error.response) {
-        console.error('Error HTTP:', error.response.status, error.response.data);
-      } else {
-        console.error('Error en la consulta:', error.message);
+      console.warn('Respuesta inesperada:', data);
+      return { error: 'UNEXPECTED_RESPONSE', message:'Respuesta inesperada del servidor.'};
+      } catch ({response, request, message}){
+        if(response?.status == 404) return { error:'DNI_NOT_FOUND', message:'No se encontró informacion para el DNI proporcionado.' };
+        console.error(response?`Error de respuesta: ${response.status}`: request? 'No ser encontró información para el DNI proporcionado':`Error:${message}`);
+        return { error: 'REQUEST_FAILED', message:'Hubo un problema al consultar el DNI.'};
       }
-    }
+    };
+const enviarDatosUsuario = async(datosUsuario)=>{
+  try{
+    const response = await axios.post('https://ram-special-evenly.ngrok-free.app/api-mongo/api/miPerfil_v1_1', datosUsuario);
+    console.log('Datos enviados exitosamente:', response.data);
+    return response.data;
+  }catch(error){
+    console.error('Error al enviar datos:', error);
+    throw error;
   }
+}
 const GetPerfilRiesgoSocio = async (EDAD, ESTADO_CIVIL, GIRO, NOM_FRECUENCIA, SEXO) => {
   try {
     //const response = await axios.post('http://127.0.0.1:5002/api/predict', {
@@ -171,320 +308,353 @@ const userStates = {};
 
 // Función para reiniciar el estado del usuario
 function reiniciarEstadoUsuario(userState) {
-  userState.step = 'bienvenida';
-  userState.lastActivity = Date.now();
-  userState.expirationShown = false;
-  userState.warningShown = false;
-  userState.processoCompletado = false;
-  userState.dni = null;
-  userState.datosReniec = null;
-  userState.edad = null;
-  userState.sexo = null;
-  userState.estado_civil = null;
-  userState.giro = null;
-  userState.frecuencia = null;
-}
+  Object.assign(userState,{
+    step : 'bienvenida',
+    lastActivity : Date.now(),
+    expirationShown : false,
+    warningShown : false,
+    processoCompletado : false,
+    dni : null,
+    datosReniec : null,
+    edad : null,
+    sexo : null,
+    estado_civil : null,
+    giro : null,
+    frecuencia : null,
+    reportState : null,
+    user : null,
+    fechaInicio : null,
+    fecha_fin : null
+  });
+
+};
 
 const handleUserInput = async (client, message, userState) => {
-  switch (userState.step) {
-    case 'confirmacion_inicio':
-      if (message.body.toLowerCase() === 'sí' || message.body.toLowerCase() === 'si') {
-        // await client.getBatteryLevel();
-        await client.sendText(message.from, "¡Perfecto! 🎉 Vamos a avanzar con tu solicitud.\n\nPor favor, ingresa tu *número de DNI*: 🆔");
-        userState.step = 'esperando_dni';
-      } else {
-        await client.sendText(message.from, 
-          "Entiendo que no estés listo. Cuando quieras comenzar, solo escribe *SÍ*. " +
-          "Estaré aquí para ayudarte en cualquier momento."
-        );
+  const sendMessage = async (text) => await client.sendText(message.from, text);
+  const isValidValue = (value) => value !== null && value !== undefined && value !== '';
+  const getSafeMessageBody = ()=> message?.body?.trim()?? '';
+
+  const handleSteps ={
+    confirmacion_inicio:async () => {
+      const response = getSafeMessageBody().toLowerCase();
+      if(response === 'si' || response === 'sí'){
+        await sendMessage("¡Perfecto! 🎉 Vamos a avanzar con tu solicitud.\n\nPor favor, ingresa tu *número de DNI*: 🆔");
+        userState.step ='esperando_dni';
+      }else{
+        await sendMessage('Entiendo que no estes listo. Cuando quieras comenzar, solo escribe *SI*. Estaré aquí para ayudarte en cualquier momento');
       }
-      break;
-    case 'inicio':
-      await client.sendText(message.from, "¡Perfecto! 🎉 Vamos a avanzar con tu solicitud.\n\nPor favor, ingresa tu *número de DNI*: 🆔");
+    },
+    inicio: async () => {
+      await sendMessage("¡Perfecto! 🎉 Vamos a avanzar con tu solicitud.\n\nPor favor, ingresa tu *número de DNI*: 🆔");
       userState.step = 'esperando_dni';
-      break;
-    case 'esperando_dni':
-      const dni = message.body.trim();
+    },
+    esperando_dni: async () => {
+      let dni = getSafeMessageBody();
     
-      if (!isNaN(dni) && dni.length === 8) {
+      if (dni.length === 8 && /^\d+$/.test(dni)) {
+        try {
           const datosSocio = await verificarNumeroDNI(dni);
-          console.log(datosSocio);     
-        if (datosSocio.success) {
-          // DNI exists in local database
-          userState.dni = dni;
-          userState.datosSocio = datosSocio;
-          await client.sendText(message.from, `Hola Sr(a) *${datosSocio.data.datos.nombres.trim()}* hemos encontrado un registro suyo.\n\nPor favor, confirma si es correcto respondiendo *Correcto* o *Act* para actualizar tus datos.`);
-          userState.step = 'actualizar';
-        } else {
-          // DNI doesn't exist in local database, proceed to validate with Reniec
-          userState.dni = dni;
-          //message.body = '.';
-          try {  
-            const datosReniec = await consultarDNI(userState.dni);
-            userState.datosReniec = datosReniec;
-            await client.sendText(message.from, `Según nuestros registros, tu *apellido paterno* es: *${datosReniec.apellido_paterno}*.\n\nPor favor, confirma si es correcto respondiendo *Sí* o *No*.`);
+          console.log(datosSocio);
+    
+          if (datosSocio.success) {
+            // DNI exists in local database
+            userState.dni = dni;
+            userState.datosSocio = datosSocio;
+            await client.sendText(
+              message.from,
+              `Hola Sr(a) *${datosSocio.data.datos.nombres.trim()}* hemos encontrado un registro suyo.\n\nPor favor, confirma si es correcto respondiendo *Correcto* o *Act* para actualizar tus datos.`
+            );
+            userState.step = 'actualizar';
+          } else {
+            // DNI doesn't exist in local database, proceed to validate with Reniec
+            const resultado = await consultarDNI(dni);
+    
+            if (resultado?.error === 'DNI_NOT_FOUND') {
+              await sendMessage('No se encontró información para el DNI proporcionado. Por favor, verifica el número e intenta nuevamente.');
+              return;
+            }
+    
+            if (!resultado || !isValidValue(resultado.apellido_paterno)) {
+              await sendMessage('No se pudo obtener la información completa. Por favor, intenta nuevamente más tarde.');
+              return;
+            }
+    
+            userState.dni = dni;
+            userState.datosReniec = resultado;
+            await sendMessage(`Según nuestros registros, tu *apellido paterno* es: *${resultado.apellido_paterno}*.\n\nPor favor, confirma si es correcto respondiendo *Sí* o *No*.`);
             userState.step = 'confirmar_apellido';
-          } catch (error) {
-            console.error('Error al consultar DNI en Reniec:', error);
-            await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
-            userState.step = 'esperando_dni';
           }
+        } catch (error) {
+          console.error('Error al consultar DNI:', error);
+          await sendMessage('Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
         }
       } else {
-        await client.sendText(message.from, 'Por favor, ingresa un *DNI* válido (8 dígitos).');
+        await sendMessage('Por favor, ingresa un *DNI* válido (8 dígitos numéricos).');
       }
-      break;
-    case 'actualizar':
-      //await client.sendText(message.from, 'Seleccionaste la ') 
-      rpta = message.body.trim().toLowerCase() 
-      if (rpta === 'actualizar'|| rpta === 'act') {
-          await client.sendText(message.from,'MENU *estado civil*: 1️⃣ *Casado(a)* 💍\n2️⃣ *Conviviente* 🤝\n3️⃣ *Divorciado(a)* 🔄\n4️⃣ *Separado(a)* ↔️\n5️⃣ *Soltero(a)*\n6️⃣ *Viudo(a)*');
-          userState.step='actualizar_Estado_Civil';
-        }
-      else if(rpta ==='correcto'|| rpta ==='ok' || rpta ==='si' || rpta==='sí'||rpta ==='correct'){
-        datosGuardados=userState.datosSocio.data
-        await client.sendText(message.from, `Estos son tus datos\n\n *Edad*: ${datosGuardados.edad}🕯️\n *Estado_Civil*: ${dicc.estado_civil[datosGuardados.estado_civil]}\n *Giro*: ${dicc.ocupacion[datosGuardados.giro]} \n *Frecuencia*: ${dicc.frecuencia[datosGuardados.frecuencia]}, \n¿Es correcto? `);
-        userState.step='obtener_riesgo';
-      }
-      else{
-        await client.sendText(message.from, 'Ingrese una opción válida, *ok* para confirmar *act* para actualizar')
-      }
-        break;
-      case 'actualizar_Estado_Civil':
-        if (['1', '2', '3', '4', '5', '6'].includes(message.body.trim())) {
+    }, 
+    actualizar: async () => {
+      const rpta = message.body.trim().toLowerCase();
+    
+      if (rpta === 'actualizar' || rpta === 'act') {
+        await client.sendText(
+          message.from,
+          'MENU *estado civil*: \n1️⃣ *Casado(a)* 💍\n2️⃣ *Conviviente* 🤝\n3️⃣ *Divorciado(a)* 🔄\n4️⃣ *Separado(a)* ↔️\n5️⃣ *Soltero(a)*\n6️⃣ *Viudo(a)*'
+        );
+        userState.step = 'actualizar_Estado_Civil';
+      } else if (
+        rpta === 'correcto' || 
+        rpta === 'ok' || 
+        rpta === 'si' || 
+        rpta === 'sí' || 
+        rpta === 'correct' || 
+        rpta === 'ver'
+      ) {
+        const datosGuardados = userState.datosSocio.data;
+        await client.sendText(
+          message.from,
+          `Estos son tus datos\n\n *Edad*: ${datosGuardados.edad}🎂\n *Estado_Civil*: ${dicc.estado_civil[datosGuardados.estado_civil]}\n *Giro*: ${dicc.ocupacion[datosGuardados.giro]}\n *Frecuencia*: ${dicc.frecuencia[datosGuardados.frecuencia]}, \n¿Es correcto?`
+        );
+        userState.step = 'obtener_riesgo';
+      } else{
+              await client.sendText(message.from, 'Ingrese una opción válida, *ok* para confirmar *act* para actualizar')
+      } 
+    },
+    actualizar_Estado_Civil: async ()=>{
+          if (['1', '2', '3', '4', '5', '6'].includes(message.body.trim())) {
           userState.estado_civil = message.body.trim();
           await client.sendText(message.from, 'Selecciona tu *ocupación*:\n1️⃣ ABARROTES 🛒\n2️⃣ AUTOMOTRIZ 🚗\n3️⃣ BOTICA 💊\n4️⃣ CARPINTERÍA 🪚\n5️⃣ COMERCIANTE 🏪\n6️⃣ COMERCIO DE ALIMENTOS 🥗\n7️⃣ COMERCIO DE ANIMALES 🐾\n8️⃣ COMERCIO DE ARTESANÍA 🎨\n9️⃣ COMERCIO DE BEBIDAS 🥤\n🔟 COMERCIO DE CELULARES 📱\n1️⃣1️⃣ COMERCIO DE PROD. NO ALIMENTICIOS 🛍️\n1️⃣2️⃣ COMERCIO DE ROPA 👕\n1️⃣3️⃣ COMERCIO FERRETERO 🧰\n1️⃣4️⃣ COMERCIO MINORista 🏬\n1️⃣5️⃣ OFICIO 🧑‍🔧\n1️⃣6️⃣ OFICIO CONSTRUCCIÓN 🏗️\n1️⃣7️⃣ OTROS 🌐\n1️⃣8️⃣ PRESTADOR DE SERVICIOS 📑\n1️⃣9️⃣ PROFESIONAL 👔\n2️⃣0️⃣ RESTAURANTE 🍽️');
           userState.step = 'actualizar_giro';
         } else {
           await client.sendText(message.from, 'Por favor, selecciona una opción válida entre 1️⃣ y 6️⃣.');
-        }
-        break;
-      case 'actualizar_giro':
-        if (['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'].includes(message.body.trim())) {
+        }    
+    },
+
+   actualizar_giro : async ()=>{
+          if (['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'].includes(message.body.trim())) {
           userState.giro = message.body.trim();
           await client.sendText(message.from, '¿Cómo prefieres pagar tus cuotas? 💰\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
           userState.step = 'actualizar_frecuencia';
         } else {
           await client.sendText(message.from, 'Por favor, selecciona una opción válida entre 1️⃣ y 2️⃣0️⃣.');
         }
-        break;
-      case 'actualizar_frecuencia':
-        if (['1', '2'].includes(message.body.trim())) {
-         userState.frecuencia = message.body.trim();
- 
-         // Llamar a la API para obtener el perfil de riesgo
-         const perfilRiesgo = await GetPerfilRiesgoSocio(userState.datosSocio.data.edad, userState.estado_civil, userState.giro, userState.frecuencia, userState.datosSocio.data.sexo);
-         console.log(perfilRiesgo);
-         actualizarDatos(userState.dni, userState.estado_civil,userState.giro, userState.frecuencia, perfilRiesgo.puntaje, perfilRiesgo.score);
-         await client.sendText(message.from, 'Tus datos han sido actualizados, actualiza para obtener tu score crediticio');
-         userState.processoCompletado = true;
-        } else {
-        await client.sendText(message.from, 'Por favor, selecciona una opción válida:\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
-        }
-         break;
-        // if (!isNaN(dni) && dni.length === 8) {
-        //   try {
-        //     const datosSocio = await verificarNumeroDNI(dni);
-        //     console.log(datosSocio);
-            
-        //     if (datosSocio.success) {
-        //       // DNI exists in local database
-        //       userState.dni = dni;
-        //       userState.datosSocio = datosSocio;
-        //       await client.sendText(message.from, `Hemos encontrado tu registro. Tu nombre completo es: ${datosSocio.data.datos.nombres}. ¿Es correcto? Responde *Sí* o *No*.`);
-        //       userState.step = 'obtener_riesgo';
-        //     } else {
-        //       // DNI doesn't exist in local database, proceed to validate with Reniec
-        //       userState.dni = dni;
-        //       userState.step = 'validar_dni';
-        //       // Fall through to the next case without breaking
-        //     }
-        //   } catch (error) {
-        //     console.error('Error al verificar DNI en base local:', error);
-        //     await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
-        //     break;
-        //   }
-        // } else {
-        //   await client.sendText(message.from, 'Por favor, ingresa un *DNI* válido (8 dígitos).');
-        //   break;
-        // }
-    /*
-    case 'validar_dni':
-      try {  
-        const datosReniec = await consultarDNI(userState.dni);
-        userState.datosReniec = datosReniec;
-        await client.sendText(message.from, `Según nuestros registros, tu *apellido paterno* es: *${datosReniec.apellido_paterno}*.\n\nPor favor, confirma si es correcto respondiendo *Sí* o *No*.`);
-        userState.step = 'confirmar_apellido';
-      } catch (error) {
-        console.error('Error al consultar DNI en Reniec:', error);
-        await client.sendText(message.from, 'Hubo un problema al verificar tu DNI. Por favor, intenta nuevamente más tarde.');
-        userState.step = 'esperando_dni';
-      }
-      break;
-      */
-    case 'confirmar_apellido':
-      const confirmacion = message.body.trim().toLowerCase();
+   },
+   actualizar_frecuencia: async ()=>{
+    if (['1', '2'].includes(message.body.trim())) {
+     userState.frecuencia = message.body.trim();
 
-      if (confirmacion === 'sí' || confirmacion === 'si') {
-        const { nombres} = userState.datosReniec;//, apellido_paterno, apellido_materno, nombre_completo, departamento, provincia, distrito, direccion, direccion_completa, ubigeo_reniec, ubigeo_sunat, ubigeo, fecha_nacimiento, estado_civil, foto, sexo } = userState.datosReniec;
-        await client.sendText(message.from, `Hola *${nombres.trim()}* Gracias por escribirnos\n\n Ahora, por favor dime tu *edad*: 🎂`);
+     // Llamar a la API para obtener el perfil de riesgo
+     const perfilRiesgo = await GetPerfilRiesgoSocio(userState.datosSocio.data.edad, userState.estado_civil, userState.giro, userState.frecuencia, userState.datosSocio.data.sexo);
+     console.log(perfilRiesgo);
+     actualizarDatos(userState.dni, userState.estado_civil,userState.giro, userState.frecuencia, perfilRiesgo.puntaje, perfilRiesgo.score);
+     await client.sendText(message.from, 'Tus datos han sido actualizados, recarga para obtener tu score crediticio');
+     userState.processoCompletado = true;
+    } else {
+    await client.sendText(message.from, 'Por favor, selecciona una opción válida:\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
+    }
+},
+
+  confirmar_apellido: async () => {
+    const confirmacion = getSafeMessageBody().toLowerCase();
+    if (confirmacion === 'sí' || confirmacion === 'si') {
+      const { nombres, apellido_paterno, apellido_materno } = userState.datosReniec;
+      if (isValidValue(nombres) && isValidValue(apellido_paterno) && isValidValue(apellido_materno)) {
+        await sendMessage(`Gracias por confirmar. Tus datos completos son:\n\nNombres: *${nombres.trim()}*\nApellido Paterno: *${apellido_paterno.trim()}*\nApellido Materno: *${apellido_materno.trim()}*\n\nAhora, por favor dime tu *edad*: 🎂`);
         userState.step = 'esperando_edad';
-      } else if (confirmacion === 'no') {
-        await client.sendText(message.from, 'Por favor, ingresa nuevamente tu *DNI* correctamente: 🆔');
-        userState.step = 'esperando_dni';
       } else {
-        await client.sendText(message.from, 'Por favor, responde *Sí* o *No* para confirmar tu apellido.');
+        await sendMessage('Lo siento, parece que hay un problema con tus datos. Por favor, intenta nuevamente más tarde.');
+        reiniciarEstadoUsuario(userState);
       }
-      break;
-   
-    case 'esperando_edad':
-      const edad = parseInt(message.body.trim());
-      if (!isNaN(edad)) {
-        if (edad >= 23 && edad <= 65) {
-          userState.edad = edad;
-          await client.sendText(message.from, 'Selecciona tu *sexo*:\n1️⃣ *Femenino*\n2️⃣ *Masculino*');
-          userState.step = 'esperando_sexo';
-        } else {
-          if (edad < 23) {
-            await client.sendText(message.from, 'Lo sentimos, aún no calificas para este servicio. La edad mínima requerida es 23 años.');
-          } else {
-            await client.sendText(message.from, 'Lo sentimos, no cumples con los requisitos de edad para este servicio. La edad máxima permitida es 65 años.');
-          }
-          await client.sendText(message.from, '¿Deseas intentar nuevamente con otro DNI? Responde *Sí* para reiniciar o *No* para terminar.');
-          userState.step = 'reiniciar_o_terminar';
-        }
+    } else if (confirmacion === 'no') {
+      await sendMessage('Por favor, ingresa nuevamente tu *DNI* correctamente: 🆔');
+      userState.step = 'esperando_dni';
+    } else {
+      await sendMessage('Por favor, responde *Sí* o *No* para confirmar tu apellido.');
+    }
+  },
+  esperando_edad: async () => {
+    const edad = parseInt(getSafeMessageBody());
+    if (!isNaN(edad) && edad > 0) {
+      if (edad >= 23 && edad <= 65) {
+        userState.edad = edad;
+        await sendMessage('Selecciona tu *sexo*:\n1️⃣ *Femenino*\n2️⃣ *Masculino*');
+        userState.step = 'esperando_sexo';
       } else {
-        await client.sendText(message.from, 'Por favor, ingresa una *edad* válida en números.');
+        await sendMessage(edad < 23 ? 'Lo sentimos, aún no calificas para este servicio. La edad mínima requerida es 23 años.' : 'Lo sentimos, no cumples con los requisitos de edad para este servicio. La edad máxima permitida es 65 años.');
+        await sendMessage('¿Deseas intentar nuevamente con otro DNI? Responde *Sí* para reiniciar o *No* para terminar.');
+        userState.step = 'reiniciar_o_terminar';
       }
-      break;
-
-    case 'reiniciar_o_terminar':
-      const respuesta = message.body.trim().toLowerCase();
-      if (respuesta === 'sí' || respuesta === 'si') {
-        await client.sendText(message.from, "Vamos a empezar de nuevo. Por favor, ingresa tu *número de DNI*: 🆔");
-        userState.step = 'esperando_dni';
-      } else if (respuesta === 'no') {
-        await client.sendText(message.from, "Gracias por tu interés. Si en el futuro cumples con los requisitos, no dudes en contactarnos nuevamente.");
-        userState.step = 'inicio';  // O podrías tener un estado 'finalizado' si prefieres
-      } else {
-        await client.sendText(message.from, 'Por favor, responde *Sí* para reiniciar o *No* para terminar.');
-      }
-      break;
-    case 'esperando_sexo':
-      if (['1', '2'].includes(message.body.trim())) {
-        userState.sexo = message.body.trim();
-        await client.sendText(message.from, 'Ahora, selecciona tu *estado civil*:\n1️⃣ *Casado(a)* 💍\n2️⃣ *Conviviente* 🤝\n3️⃣ *Divorciado(a)* 🔄\n4️⃣ *Separado(a)* ↔️\n5️⃣ *Soltero(a)*\n6️⃣ *Viudo(a)*');
-        userState.step = 'esperando_estado_civil';
-      } else {
-        await client.sendText(message.from, 'Por favor, selecciona una opción válida:\n1️⃣ *Femenino*\n2️⃣ *Masculino*');
-      }
-      break;
-    case 'esperando_estado_civil':
-      if (['1', '2', '3', '4', '5', '6'].includes(message.body.trim())) {
-        userState.estado_civil = message.body.trim();
-        await client.sendText(message.from, 'Selecciona tu *ocupación*:\n1️⃣ ABARROTES 🛒\n2️⃣ AUTOMOTRIZ 🚗\n3️⃣ BOTICA 💊\n4️⃣ CARPINTERÍA 🪚\n5️⃣ COMERCIANTE 🏪\n6️⃣ COMERCIO DE ALIMENTOS 🥗\n7️⃣ COMERCIO DE ANIMALES 🐾\n8️⃣ COMERCIO DE ARTESANÍA 🎨\n9️⃣ COMERCIO DE BEBIDAS 🥤\n🔟 COMERCIO DE CELULARES 📱\n1️⃣1️⃣ COMERCIO DE PROD. NO ALIMENTICIOS 🛍️\n1️⃣2️⃣ COMERCIO DE ROPA 👕\n1️⃣3️⃣ COMERCIO FERRETERO 🧰\n1️⃣4️⃣ COMERCIO MINORista 🏬\n1️⃣5️⃣ OFICIO 🧑‍🔧\n1️⃣6️⃣ OFICIO CONSTRUCCIÓN 🏗️\n1️⃣7️⃣ OTROS 🌐\n1️⃣8️⃣ PRESTADOR DE SERVICIOS 📑\n1️⃣9️⃣ PROFESIONAL 👔\n2️⃣0️⃣ RESTAURANTE 🍽️');
-        userState.step = 'esperando_giro';
-      } else {
-        await client.sendText(message.from, 'Por favor, selecciona una opción válida entre 1️⃣ y 6️⃣.');
-      }
-      break;
-    case 'esperando_giro':
-      if (['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'].includes(message.body.trim())) {
-        userState.giro = message.body.trim();
-        await client.sendText(message.from, '¿Cómo prefieres pagar tus cuotas? 💰\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
-        userState.step = 'esperando_frecuencia';
-      } else {
-        await client.sendText(message.from, 'Por favor, selecciona una opción válida entre 1️⃣ y 2️⃣0️⃣.');
-      }
-      break;
+    } else {
+      await sendMessage('Por favor, ingresa una *edad* válida en números.');
+    }
+  },
+  reiniciar_o_terminar: async () => {
+    const respuesta = message.body.trim().toLowerCase();
+    if (respuesta === 'sí' || respuesta === 'si') {
+      await sendMessage("Vamos a empezar de nuevo. Por favor, ingresa tu *número de DNI*: 🆔");
+      userState.step = 'esperando_dni';
+    } else if (respuesta === 'no') {
+      await sendMessage("Gracias por tu interés. Si en el futuro cumples con los requisitos, no dudes en contactarnos nuevamente.");
+      userState.step = 'inicio';
+    } else {
+      await sendMessage('Por favor, responde *Sí* para reiniciar o *No* para terminar.');
+    }
+  },
+  esperando_sexo: async () => {
+    if (['1', '2'].includes(message.body.trim())) {
+      userState.sexo = message.body.trim();
+      await sendMessage('Ahora, selecciona tu *estado civil*:\n1️⃣ *Casado(a)* 💍\n2️⃣ *Conviviente* 🤝\n3️⃣ *Divorciado(a)* 🔄\n4️⃣ *Separado(a)* ↔️\n5️⃣ *Soltero(a)*\n6️⃣ *Viudo(a)*');
+      userState.step = 'esperando_estado_civil';
+    } else {
+      await sendMessage('Por favor, selecciona una opción válida:\n1️⃣ *Femenino*\n2️⃣ *Masculino*');
+    }
+  },
+  esperando_estado_civil: async () => {
+    if (['1', '2', '3', '4', '5', '6'].includes(message.body.trim())) {
+      userState.estado_civil = message.body.trim();
+      await sendMessage('Selecciona tu *ocupación*:\n1️⃣ ABARROTES 🛒\n2️⃣ AUTOMOTRIZ 🚗\n3️⃣ BOTICA 💊\n4️⃣ CARPINTERÍA 🪚\n5️⃣ COMERCIANTE 🏪\n6️⃣ COMERCIO DE ALIMENTOS 🥗\n7️⃣ COMERCIO DE ANIMALES 🐾\n8️⃣ COMERCIO DE ARTESANÍA 🎨\n9️⃣ COMERCIO DE BEBIDAS 🥤\n🔟 COMERCIO DE CELULARES 📱\n1️⃣1️⃣ COMERCIO DE PROD. NO ALIMENTICIOS 🛍️\n1️⃣2️⃣ COMERCIO DE ROPA 👕\n1️⃣3️⃣ COMERCIO FERRETERO 🧰\n1️⃣4️⃣ COMERCIO MINORista 🏬\n1️⃣5️⃣ OFICIO 🧑‍🔧\n1️⃣6️⃣ OFICIO CONSTRUCCIÓN 🏗️\n1️⃣7️⃣ OTROS 🌐\n1️⃣8️⃣ PRESTADOR DE SERVICIOS 📑\n1️⃣9️⃣ PROFESIONAL 👔\n2️⃣0️⃣ RESTAURANTE 🍽️');
+      userState.step = 'esperando_giro';
+    } else {
+      await sendMessage('Por favor, selecciona una opción válida entre 1️⃣ y 6️⃣.');
+    }
+  },
+  
+  esperando_giro: async () => {
+    if (['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'].includes(message.body.trim())) {
+      userState.giro = message.body.trim();
+      await sendMessage('¿Cómo prefieres pagar tus cuotas? 💰\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
+      userState.step = 'esperando_frecuencia';
+    } else {
+      await sendMessage('Por favor, selecciona una opción válida entre 1️⃣ y 2️⃣0️⃣.');
+    }
+  },
+  obtener_riesgo: async () => {
+    console.log('Entrando al caso final');
+    const respuesta = message.body.trim().toLowerCase();
+  
+    if (respuesta === 'no') {
+      await client.sendText(
+        message.from,
+        'Ups🧑‍🔧, \nNo te preocupes, recalcularemos tu score crediticio. Por favor, ingresa tus nuevos datos correctamente.'
+      );
+      await client.sendText(
+        message.from,
+        'MENU *estado civil*: \n1️⃣ *Casado(a)* 💍\n2️⃣ *Conviviente* 🤝\n3️⃣ *Divorciado(a)* 🔄\n4️⃣ *Separado(a)* ↔️\n5️⃣ *Soltero(a)*\n6️⃣ *Viudo(a)*'
+      );
+      userState.step = 'actualizar_Estado_Civil';
+    } else {
+      await client.sendText(message.from, `Gracias por confiar en nosotros🫡`);
+      await client.sendText(
+        message.from,
+        `Su *score crediticio* es: *${userState.datosSocio.data.puntaje}* 📊\n\n y su *Calificación* es de: *${userState.datosSocio.data.score}*`
+      );
+      userState.processoCompletado = true;
+    }
+  },
+  esperando_frecuencia: async () => {
+    const frecuencia = getSafeMessageBody();
+    if (['1', '2'].includes(frecuencia)) {
+      userState.frecuencia = frecuencia;
       
-    case 'esperando_frecuencia':
-      if (['1', '2'].includes(message.body.trim())) {
-        userState.frecuencia = message.body.trim();
-
-        // Llamar a la API para obtener el perfil de riesgo
+      // Verificar que todos los datos necesarios estén presentes
+      const datosNecesarios = [userState.edad, userState.estado_civil, userState.giro, userState.frecuencia, userState.sexo];
+      if (datosNecesarios.every(isValidValue)) {
         const perfilRiesgo = await GetPerfilRiesgoSocio(userState.edad, userState.estado_civil, userState.giro, userState.frecuencia, userState.sexo);
-        console.log(perfilRiesgo);
-        if (perfilRiesgo && perfilRiesgo.puntaje != undefined) {
-          await client.sendText(message.from, `Tu *score crediticio* es: *${perfilRiesgo.puntaje.toFixed(3)}* 📊`);
-          await client.sendText(message.from, `Calificación: *${perfilRiesgo.score}*`);
+        
+        if (perfilRiesgo && isValidValue(perfilRiesgo.puntaje)) {
+          await sendMessage(`Tu *score crediticio* es: *${perfilRiesgo.puntaje.toFixed(3)}* 📊`);
+          await sendMessage(`Calificación: *${perfilRiesgo.score}*`);
 
-          if (perfilRiesgo.score === 'Bueno') {
-            await client.sendText(message.from, '¡Felicitaciones! Tienes una alta posibilidad de acceder al crédito. Un asesor financiero se comunicará contigo pronto. 📞');
-          } else if (perfilRiesgo.score === 'Regular') {
-            await client.sendText(message.from, 'Tienes una posibilidad moderada de acceder al crédito. Un asesor financiero se comunicará contigo para discutir tus opciones. 📞');
-          } else {
-            await client.sendText(message.from, 'Lo sentimos, tu *score* no es favorable. Sin embargo, un asesor financiero se comunicará contigo para explorar otras opciones. 📞');
-          }
-        //   let m = userState.lastActivity
-          const date = new Date(userState.lastActivity);
-          fecha = formatDate(date);
-          hora = formatTime(date)
-        //   console.log(hora);
-        //   let dateString = m.getUTCFullYear() +"/"+ (m.getUTCMonth()+1) +"/"+ m.getUTCDate() + " " + m.getUTCHours() + ":" + m.getUTCMinutes() + ":" + m.getUTCSeconds();
-        //   console.log(typeof(hora));
-          // Guardar los datos 
-          const nuevoUsuario = new Usuario({
-            telefono: message.from,
-            fechaConsulta: fecha,
-            horaConsulta: hora,
-            dni: userState.dni,
-            datos: {
-                nombres: userState.datosReniec.nombres,
-                apellido_paterno: userState.datosReniec.apellido_paterno,
-                apellido_materno: userState.datosReniec.apellido_materno,
-                nombre_completo: userState.datosReniec.nombre_completo,
-                departamento: userState.datosReniec.departamento,
-                provincia: userState.datosReniec.provincia,
-                distrito: userState.datosReniec.distrito,
-                direccion: userState.datosReniec.direccion,
-                direccion_completa: userState.datosReniec.direccion_completa,
-                ubigeo_reniec: userState.datosReniec.ubigeo_reniec,
-                ubigeo_sunat: userState.datosReniec.ubigeo_sunat,
-                ubigeo: userState.datosReniec.ubigeo,
-                fecha_nacimiento: userState.datosReniec.fecha_nacimiento,
-                foto: userState.datosReniec.foto
-              },
-            edad: parseInt(userState.edad),
-            sexo: userState.sexo,
-            estado_civil: userState.estado_civil,
-            giro: userState.giro,
-            frecuencia: userState.frecuencia,
-            puntaje: perfilRiesgo.puntaje,
-            score: perfilRiesgo.score
-          });
-
+        if (perfilRiesgo.score === 'Bueno') {
+          await sendMessage('¡Felicitaciones! Tienes una alta posibilidad de acceder al crédito. Un asesor financiero se comunicará contigo pronto. 📞');
+        } else if (perfilRiesgo.score === 'Regular') {
+          await sendMessage('Tienes una posibilidad moderada de acceder al crédito. Un asesor financiero se comunicará contigo para discutir tus opciones. 📞');
+        } else {
+          await sendMessage('Lo sentimos, tu *score* no es favorable. Sin embargo, un asesor financiero se comunicará contigo para explorar otras opciones. 📞');
+        }
+        const datosUsuario = {
+          CELULAR: 'proof_number', //message.from
+          DNI_CONSULTADO: 'proof_ID', //userState.dni
+          NOM_FRECUENCIA: userState.frecuencia,
+          EDAD: parseInt(userState.edad),
+          SEXO: userState.sexo,
+          ESTADO_CIVIL: userState.estado_civil,
+          GIRO: userState.giro
+        };
+        const date = new Date(userState.lastActivity);
+        fecha = formatDate(date);
+        hora = formatTime(date)
+        const nuevoUsuario = new Usuario({
+          telefono: message.from,
+          fechaConsulta: fecha,
+          horaConsulta: hora,
+          dni: userState.dni,
+          datos: {
+              nombres: userState.datosReniec.nombres,
+              apellido_paterno: userState.datosReniec.apellido_paterno,
+              apellido_materno: userState.datosReniec.apellido_materno,
+              nombre_completo: userState.datosReniec.nombre_completo,
+              departamento: userState.datosReniec.departamento,
+              provincia: userState.datosReniec.provincia,
+              distrito: userState.datosReniec.distrito,
+              direccion: userState.datosReniec.direccion,
+              direccion_completa: userState.datosReniec.direccion_completa,
+              ubigeo_reniec: userState.datosReniec.ubigeo_reniec,
+              ubigeo_sunat: userState.datosReniec.ubigeo_sunat,
+              ubigeo: userState.datosReniec.ubigeo,
+              fecha_nacimiento: userState.datosReniec.fecha_nacimiento,
+              foto: userState.datosReniec.foto
+            },
+          edad: parseInt(userState.edad),
+          sexo: userState.sexo,
+          estado_civil: userState.estado_civil,
+          giro: userState.giro,
+          frecuencia: userState.frecuencia,
+          puntaje: perfilRiesgo.puntaje,
+          score: perfilRiesgo.score
+        });
           await nuevoUsuario.save();
 
-          // Mensaje de finalización
-          await client.sendText(message.from, 'Gracias por completar el proceso. Si necesitas algo más, no dudes en contactarnos nuevamente.');
+          const datosValidos = Object.fromEntries(
+            Object.entries(datosUsuario).filter(([_, valor]) => isValidValue(valor))
+          );
           
-          // Marcar el proceso como completado
-          userState.processoCompletado = true;
+          if (Object.keys(datosValidos).length > 0) {
+            await enviarDatosUsuario(datosValidos);
+            /*const mensajeDatos = Object.entries(datosValidos)
+              .map(([clave, valor]) => `${clave}: ${valor}`)
+              .join('\n');
+            await sendMessage(`Datos registrados:\n${mensajeDatos}`);*/
+          } else {
+            console.log('No hay datos válidos para enviar.');
+            await sendMessage('Lo siento, hubo un problema al procesar tus datos. Por favor, intenta nuevamente más tarde.');
+            reiniciarEstadoUsuario(userState);
+          }
 
+          await sendMessage('Gracias por completar el proceso. Si necesitas algo más, no dudes en contactarnos nuevamente.');
+          userState.processoCompletado = true;
         } else {
-          await client.sendText(message.from, 'Hubo un problema al obtener tu perfil de riesgo. Por favor, inténtalo nuevamente más tarde.');
+          await sendMessage('Hubo un problema al obtener tu perfil de riesgo. Por favor, inténtalo nuevamente más tarde.');
           reiniciarEstadoUsuario(userState);
         }
       } else {
-        await client.sendText(message.from, 'Por favor, selecciona una opción válida:\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
+        await sendMessage('Lo siento, parece que falta información importante. Vamos a comenzar de nuevo.');
+        reiniciarEstadoUsuario(userState);
       }
-      break;
-    case 'obtener_riesgo':
-      console.log('Entrando al caso final');
-      // console.log(userState.datosSocio)
-      await client.sendText(message.from, `Gracias por confiar en nosotros🫡`);
-      await client.sendText(message.from, `Su *score crediticio* es: *${userState.datosSocio.data.puntaje}* 📊\n\n y su *Calificación* es de: *${userState.datosSocio.data.score}* `);
-      userState.processoCompletado = true;
-      break;
-    default:
-      reiniciarEstadoUsuario(userState);
-      await client.sendText(message.from, 'Bienvenido. Vamos a calcular tu perfil de riesgo.');
-      await handleUserInput(client, message, userState);
+    } else {
+      await sendMessage('Por favor, selecciona una opción válida:\n1️⃣ *Meses* 📅\n2️⃣ *Semanas* 📆');
+    }
   }
 };
 
-// Iniciar sesión y escuchar mensajes
+if (handleSteps[userState.step]) {
+  await handleSteps[userState.step]();
+} else {
+  reiniciarEstadoUsuario(userState);
+  await sendMessage('Bienvenido. Vamos a calcular tu perfil de riesgo.');
+  await handleUserInput(client, message, userState);
+}
+};
+
 venom
   .create({
     session: 'session-name',
@@ -498,10 +668,101 @@ venom
   })
   .catch((error) => {
     console.error('Error al iniciar el cliente de WhatsApp:', error);
-  });
+});
 
-const TIMEOUT = 2 * 60 * 1000; // 2 minutos en milisegundos
-const WARNING_TIME = 1 * 60 * 1000; // 1 minuto en milisegundos
+const TIMEOUT = 2 * 60 * 1000;
+const WARNING_TIME = 1 * 60 * 1000;
+  
+function start(client) {
+  client.onMessage(async (message) => {
+    console.log('Mensaje recibido:', message.body);
+  
+    let userState = userStates[message.from] || { 
+      step: 'bienvenida', 
+      lastActivity: Date.now(), 
+      warningShown: false, 
+      expirationShown: false, 
+      processoCompletado: false,
+      reportState: null
+    };
+  
+    userStates[message.from] = userState;
+    userState.lastActivity = Date.now();
+  
+    const messageBody = message.body?.toLowerCase().trim() || '';
+  
+    if (messageBody === 'reporte' || userState.reportState) {
+      if (!userState.reportState) {
+        userState.reportState = { step: 'inicio_reporte' };
+      }
+      const reporteCompletado = await handleReportCommand(client, message, userState.reportState);
+      if (reporteCompletado) {
+        userState.reportState = null;
+      }
+    } else if (['hola', 'hello', 'hi', 'hey', 'inicio', 'empezar'].includes(messageBody) || userState.processoCompletado) {
+      reiniciarEstadoUsuario(userState);
+      await handleRegularConversation(client, message, userState);
+    } else {
+      await handleRegularConversation(client, message, userState);
+    }
+  
+    console.log('Estado final del usuario:', userStates[message.from]);
+  });
+  
+  setInterval(() => checkInactiveSessions(client), WARNING_TIME);
+};
+  
+async function handleRegularConversation(client, message, userState) {
+  if (userState.step === 'bienvenida') {
+    await sendWelcomeMessage(client, message.from);
+    userState.step = 'confirmacion_inicio';
+  } else {
+    await handleUserInput(client, message, userState);
+  }
+};
+
+// Función para enviar mensaje de bienvenida
+async function sendWelcomeMessage(client, to) {
+  await client.sendText(to,
+    "¡Hola! 👋✨ Soy *ESTRELLA* ✨, tu asistente para conseguir el crédito digital que necesitas, ¡rápido y sin complicaciones! 💸\n\n" +
+    "⚠️ *Antes de comenzar, es importante que sepas:* ⚠️\n\n" +
+    "🔹 *Este crédito está dirigido principalmente a personas no bancarizadas o sin historial crediticio.* 📊\n\n" +
+    "🔹 *Si tienes cuenta de crédito, debes estar al día en tus pagos en los últimos 3 meses.* 🕒\n\n" +
+    "🔹 *Si tienes cuentas de crédito en más de 3 entidades, no calificarás.* ❌\n\n" +
+    "🔹 *Toda la información que proporciones será verificada, así que es crucial que sea verídica. Datos incorrectos resultarán en el rechazo de la solicitud.* ✅\n\n" +
+    "Si cumples con estos requisitos, me gustaría conocerte un poco mejor. 😊\n\n" +
+    "¿Estás listo para empezar? Responde con *SÍ* y comenzamos. 👍"
+  );
+};
+
+// Función para reiniciar el estado del usuario
+function reiniciarEstadoUsuario(userState) {
+  userState.step = 'bienvenida';
+  userState.lastActivity = Date.now();
+  userState.warningShown = false;
+  userState.expirationShown = false;
+  userState.processoCompletado = false;
+  userState.reportState = null;
+};
+
+// Función para verificar sesiones inactivas
+function checkInactiveSessions(client) {
+  const now = Date.now();
+  Object.entries(userStates).forEach(([userId, state]) => {
+    if (!state.processoCompletado) {
+      const inactiveTime = now - state.lastActivity;
+      if (inactiveTime > WARNING_TIME && inactiveTime <= TIMEOUT && !state.warningShown) {
+        client.sendText(userId, `¿Sigues ahí? Tu sesión se cerrará por inactividad en ${Math.ceil((TIMEOUT - inactiveTime) / 60000)} minuto(s). Si quieres continuar, digita tu respuesta.`);
+        state.warningShown = true;
+      } else if (inactiveTime > TIMEOUT && !state.expirationShown) {
+        client.sendText(userId, "Tu sesión ha expirado por inactividad. Por favor, escribe 'hola' para comenzar de nuevo cuando estés listo.");
+        reiniciarEstadoUsuario(state);
+        state.expirationShown = true;
+      }
+    }
+  });
+};
+
 
 function formatDate(date) {
     // Extract year, month, and day for YYYY-MM-DD format
@@ -520,62 +781,4 @@ function formatTime(date) {
     const seconds = date.getSeconds().toString().padStart(2, '0');
     const milliseconds = date.getMilliseconds().toString().padStart(3, '0');
     return `${hours}:${minutes}:${seconds}.${milliseconds}`;
-}
-function reiniciarEstadoUsuario(userState) {
-  userState.step = 'bienvenida';
-  userState.lastActivity = Date.now();
-  userState.expirationShown = false;
-  userState.warningShown = false;
-  userState.processoCompletado = false; // Nuevo estado
-}
-
-function start(client) {
-  client.onMessage(async message => {
-    console.log('Mensaje recibido:', message.body);
-    let userState = userStates[message.from] || { step: 'bienvenida', lastActivity: Date.now(), warningShown: false, expirationShown: false, processoCompletado: false };
-
-    // Si el proceso está completado o es un nuevo mensaje, reinicia el estado
-    if (userState.processoCompletado || ['hola', 'hello', 'volver', 'salir', 'inicio', 'empezar'].includes(message.body.toLowerCase().trim())) {
-      reiniciarEstadoUsuario(userState);
-    }
-    userStates[message.from] = userState;
-
-    // Actualizar el tiempo de última actividad
-    userState.lastActivity = Date.now();
-    userState.warningShown = false;
-    userState.expirationShown = false;
-
-    if (userState.step === 'bienvenida') {
-      await client.sendText(message.from, 
-        "¡Hola! 👋 ✨ Soy *ESTRELLA* ✨, tu asistente para conseguir el crédito digital que necesitas, ¡rápido y sin complicaciones! 💸\n\n"+
-        "Para ofrecerte las mejores opciones, me gustaría conocerte un poco mejor. 😊\n\n" +
-        "¿Estás listo para empezar? Responde con *SÍ* y comenzamos. 👍"
-      );
-      userState.step = 'confirmacion_inicio';
-    } else {
-      await handleUserInput(client, message, userState);
-    }
-
-    console.log('Estado final del usuario:', userStates[message.from]);
-  });
-
-  // Configurar un intervalo para verificar sesiones inactivas
-  setInterval(() => {
-    const now = Date.now();
-    for (let [userId, state] of Object.entries(userStates)) {
-      // Solo verificar si el proceso no está completado
-      if (!state.processoCompletado) {
-        const inactiveTime = now - state.lastActivity;
-        if (inactiveTime > WARNING_TIME && inactiveTime <= TIMEOUT && !state.warningShown) {
-          client.sendText(userId, `¿Sigues ahí? Tu sesión se cerrará por inactividad en ${Math.ceil((TIMEOUT - inactiveTime) / 60000)} minuto(s). Si quieres continuar, digite su respuesta.`);
-          state.warningShown = true;
-        } else if (inactiveTime > TIMEOUT && !state.expirationShown) {
-          client.sendText(userId, "Tu sesión ha expirado por inactividad. Por favor, escribe 'hola' para comenzar de nuevo cuando estés listo.");
-          reiniciarEstadoUsuario(state);
-          state.warningShown = true;
-          state.expirationShown = true;
-        }
-      }
-    }
-  }, WARNING_TIME);
 }
